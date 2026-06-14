@@ -22,11 +22,17 @@
 
         NSString *enableKey = [ARStore enableKey:[self bid]];
         BOOL enabled = [ARStore appEnabled:[self bid]];
+        BOOL isSpringBoard = [[self bid] isEqualToString:@"com.apple.springboard"];
 
-        [specs addObject:[self groupNamed:[self bid]
-                                   footer:@"Lock this app to the ticked orientations. Tick one for a hard lock; "
-                                          @"tick several to allow rotation only among them. Untick all to leave the "
-                                          @"app's own behaviour alone."]];
+        NSString *footer = isSpringBoard
+            ? @"Rotates the Home Screen and Lock Screen. Lock Screen works well; the Home "
+              @"Screen in landscape is beta — Notification Center, Today View, returning to "
+              @"the Home Screen from an app, or exiting the App Switcher can reflow the icons "
+              @"until the next device rotation. Respring after applying."
+            : @"Lock this app to the ticked orientations. Tick one for a hard lock; "
+              @"tick several to allow rotation only among them. Untick all to leave the "
+              @"app's own behaviour alone.";
+        [specs addObject:[self groupNamed:[self bid] footer:footer]];
         [specs addObject:[self switchSpecifierNamed:@"Enabled" key:enableKey default:NO]];
 
         [specs addObject:[self groupNamed:@"Orientations" footer:!enabled ? @"Enable this app first." : nil]];

@@ -98,13 +98,47 @@ make package
 
 # rootful .deb (palera1n rootful, checkra1n, unc0ver) — same source
 make package THEOS_PACKAGE_SCHEME=
+
+# debug build: adds the file logger + a "Debug logging" switch in the panel. Omit the
+# flag for release packages (the logger code and switch are then absent entirely).
+make package AR_DEBUG=1
 ```
+
+The debug log lands at
+`/var/jb/var/mobile/Library/Preferences/com.i0stweak3r-sr.autorotate.debug.log` (rootful:
+without the `/var/jb` prefix); enable it with the **Debug logging** switch + Apply.
 
 > Building from a Windows checkout under `/mnt/d/...`? Normalise line endings first or
 > `make`/`dpkg` will choke:
 > `find . -name Makefile -o -name control | xargs sed -i 's/\r$//'`
 
 The finished packages land in `./packages/`.
+
+> **arm64 vs arm64e.** The Linux toolchain emits **arm64 only**. That hooks App Store /
+> user apps everywhere, but on **A12+ devices** the system processes (SpringBoard,
+> Preferences, stock apps) run as **arm64e** and an arm64-only dylib won't inject into
+> them. To cover system apps on A12+ you need an **arm64e** slice — build on macOS (below).
+> A11 devices (iPhone 8/X, the iOS 16 floor) are arm64, so the Linux build is complete there.
+
+## Building on macOS (arm64 + arm64e)
+
+The Xcode toolchain emits arm64e and `lipo` merges the slices, so this is the build that
+covers system apps on A12+ devices. This is what CI (`.github/workflows/build.yml`) runs
+on an Apple-Silicon `macos-15` runner.
+
+```bash
+# tooling
+brew install ldid dpkg make
+export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"   # GNU make 4+
+
+# theos (uses the installed Xcode iPhoneOS SDK)
+export THEOS=~/theos
+git clone --recursive https://github.com/theos/theos.git $THEOS
+
+# build both schemes with both slices
+make package FINALPACKAGE=1 ARCHS="arm64 arm64e"                          # rootless
+make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME= ARCHS="arm64 arm64e"    # rootful
+```
 
 ## 4. Install on device
 

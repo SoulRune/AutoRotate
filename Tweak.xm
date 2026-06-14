@@ -19,18 +19,19 @@
 // rootless; rootful keeps the bare "/var/mobile/..." path.
 static NSString *AppliedPlistPath(void) {
     NSString *root = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"] ? @"/var/jb" : @"";
-    return [NSString stringWithFormat:@"%@/var/mobile/Library/Preferences/com.i0stweak3r.autorotate.applied.plist", root];
+    return [NSString stringWithFormat:@"%@/var/mobile/Library/Preferences/com.i0stweak3r-sr.autorotate.applied.plist", root];
 }
 
-// Debug log, written next to the prefs (readable over SSH; no syslog tooling needed).
-// Only active processes that can write the path log — fine for diagnosing system apps
-// like Settings. Toggled by the "Debug logging" switch (applied like any other pref).
+// Debug logging is compiled in only with -DAR_DEBUG=1 (`make package AR_DEBUG=1`). In a
+// release build ARLog() is a no-op macro and none of the logger code, the "Debug" pref,
+// or the marker-file plumbing exists.
+#if AR_DEBUG
 static BOOL gDebug = NO;
 static NSString *JBRoot(void) {
     return [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"] ? @"/var/jb" : @"";
 }
 static NSString *LogPath(void) {
-    return [NSString stringWithFormat:@"%@/var/mobile/Library/Preferences/com.i0stweak3r.autorotate.debug.log", JBRoot()];
+    return [NSString stringWithFormat:@"%@/var/mobile/Library/Preferences/com.i0stweak3r-sr.autorotate.debug.log", JBRoot()];
 }
 // Logging is on when either the "Debug" pref is applied OR a marker file exists. The
 // marker decouples diagnosis from the apply pipeline: `touch` it over SSH and every
@@ -39,15 +40,8 @@ static NSString *MarkerPath(void) {
     return [NSString stringWithFormat:@"%@/var/mobile/autorotate.debug", JBRoot()];
 }
 static BOOL DebugOn(void) {
-    if (gDebug) return YES;
-    // Always log inside Settings — it's the benchmark we're debugging, and this avoids
-    // depending on the Debug pref / marker reaching the process.
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    if ([bid isEqualToString:@"com.apple.Preferences"] || [bid isEqualToString:@"com.apple.springboard"]) return YES;
-    return [[NSFileManager defaultManager] fileExistsAtPath:MarkerPath()];
+    return gDebug || [[NSFileManager defaultManager] fileExistsAtPath:MarkerPath()];
 }
-// Unconditional write — used for the load line so the file appears whenever the dylib
-// loads into a process that can write the path (Settings/SpringBoard can).
 static void ARLogWrite(NSString *line) {
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
     NSString *path = LogPath();
@@ -63,6 +57,9 @@ static void ARLog(NSString *fmt, ...) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
     ARLogWrite([NSString stringWithFormat:@"%@ [%@] %@\n", [NSDate date], bid, msg]);
 }
+#else
+#define ARLog(...) ((void)0)
+#endif
 
 // Resolved state for the current process.
 static BOOL gMasterEnabled = NO;   // global master switch
@@ -98,7 +95,9 @@ static void LoadPrefs(void) {
     if (bid.length == 0) return;
 
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:AppliedPlistPath()];
+#if AR_DEBUG
     gDebug = [prefs[@"Debug"] boolValue];
+#endif
     if (!prefs) { ARLog(@"LoadPrefs: no applied plist at %@", AppliedPlistPath()); return; }
 
     gMasterEnabled = [prefs[@"Enabled"] boolValue];
@@ -298,7 +297,7 @@ static void ForceOrientationSoon(void) {
     return %orig;
 }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    if (Active()) { ARLog(@"SBHomeScreenVC supportedInterfaceOrientations -> 0x%lx", (unsigned long)gMask); return gMask; }
+    if (Active()) return gMask;
     return %orig;
 }
 %end
@@ -326,10 +325,8 @@ static void HandleApplied(CFNotificationCenterRef center, void *observer, CFStri
     @autoreleasepool {
         gSwizzled = [NSMutableSet set];
         NSString *procBID = [[NSBundle mainBundle] bundleIdentifier];
-        // Unconditional load line: proves whether the dylib is injected into this process
-        // at all (independent of the Debug pref / apply pipeline).
-        ARLogWrite([NSString stringWithFormat:@"%@ [%@] ctor: dylib loaded\n", [NSDate date], procBID ?: @"?"]);
-        LoadPrefs();
+        LoadPrefs();              // sets gDebug, so logging below honours the switch
+        ARLog(@"ctor: dylib loaded");
 
         // Initialise the default (ungrouped) hooks. Required explicitly because the named
         // group below means Logos no longer auto-inserts this for us.
@@ -339,7 +336,7 @@ static void HandleApplied(CFNotificationCenterRef center, void *observer, CFStri
 
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         HandleApplied,
-                                        CFSTR("com.i0stweak3r.autorotate/applied"), NULL,
+                                        CFSTR("com.i0stweak3r-sr.autorotate/applied"), NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
 
         // Force the orientation once the app is up and again whenever a scene activates,

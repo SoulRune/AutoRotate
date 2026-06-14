@@ -4,8 +4,8 @@ Depends: ellekit | mobilesubstrate, preferenceloader, applist
 Conflicts: com.i0stweak3r.autorotate
 Replaces: com.i0stweak3r.autorotate
 Provides: com.i0stweak3r.autorotate
-Version: 2.0
-Architecture: iphoneos-arm64
+Version: 2.1.1
+Architecture: iphoneos-arm
 Description: Per-app orientation lock — hard-lock each app (system apps included) to the orientations you pick, from a Settings panel with Apply / Reset / Respring.
 Maintainer: i0s_tweak3r, SoulRune
 Author: i0s_tweak3r, SoulRune

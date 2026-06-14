@@ -4,9 +4,9 @@
 #import <notify.h>
 #import <spawn.h>
 
-static NSString *const kDraftDomain   = @"com.i0stweak3r.autorotate";
-static NSString *const kAppliedDomain = @"com.i0stweak3r.autorotate.applied";
-static NSString *const kAppliedNotify = @"com.i0stweak3r.autorotate/applied";
+static NSString *const kDraftDomain   = @"com.i0stweak3r-sr.autorotate";
+static NSString *const kAppliedDomain = @"com.i0stweak3r-sr.autorotate.applied";
+static NSString *const kAppliedNotify = @"com.i0stweak3r-sr.autorotate/applied";
 
 // Minimal private API surface for enumerating installed apps.
 @interface LSApplicationProxy : NSObject
@@ -111,7 +111,7 @@ static NSString *const kAppliedNotify = @"com.i0stweak3r.autorotate/applied";
     // the top. They use the same orientation model as apps (the tweak reads the same keys
     // by bundle id) but need their own SpringBoard hooks to actually rotate.
     if (system) {
-        [result insertObject:@{ @"id": @"com.apple.springboard", @"name": @"Home & Lock Screen" } atIndex:0];
+        [result insertObject:@{ @"id": @"com.apple.springboard", @"name": @"Home & Lock Screen (beta)" } atIndex:0];
     }
     return result;
 }

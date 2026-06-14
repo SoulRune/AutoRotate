@@ -23,7 +23,9 @@
         [specs addObject:[self groupNamed:@"AutoRotate"
                                    footer:@"Master switch for the whole tweak. Configure apps below, then tap Apply."]];
         [specs addObject:[self switchSpecifierNamed:@"Enabled (master)" key:@"Enabled" default:NO]];
+#if AR_DEBUG
         [specs addObject:[self switchSpecifierNamed:@"Debug logging" key:@"Debug" default:NO]];
+#endif
 
         [specs addObject:[self groupNamed:@"" footer:@"Apply writes your changes and updates running apps "
                                                      @"(others change on next launch). Nothing takes effect until you Apply."]];
