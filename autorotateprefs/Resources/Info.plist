@@ -5,24 +5,18 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>English</string>
 	<key>CFBundleExecutable</key>
-	<string>AutoRotate</string>
+	<string>autorotateprefs</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.i0stweak3r.autorotate</string>
+	<string>com.i0stweak3r.autorotateprefs</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>autorotateprefs</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
-	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
-	<key>CFBundleSignature</key>
-	<string>????</string>
 	<key>CFBundleVersion</key>
-	<string>1.0</string>
-	<key>DTPlatformName</key>
-	<string>iphoneos</string>
-	<key>MinimumOSVersion</key>
-	<string>3.0</string>
+	<string>2.0</string>
 	<key>NSPrincipalClass</key>
-	<string>AutoRotateListController</string>
+	<string>ARRootListController</string>
 </dict>
 </plist>

@@ -1,354 +1,368 @@
+// AutoRotate — per-app orientation lock for iOS 15–16+ (rootless/rootful).
+//
+// The dylib is injected into every UIKit process (Filter = com.apple.UIKit), so it
+// runs inside each app — system apps included. On launch it reads the *applied*
+// preferences, finds its own bundle id, and if that app is enabled it hard-locks the
+// interface to exactly the orientations the user ticked.
+//
+// "Applied" vs "draft": the Settings panel edits a draft plist. Nothing takes effect
+// until the user taps Apply, which copies draft -> applied and posts a Darwin
+// notification. Apps therefore never change behaviour on their own — only on Apply
+// (live, for running apps) or at next launch (which reads the applied plist).
+
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 
-
-const CGFloat firmware =  [[UIDevice currentDevice].systemVersion floatValue];
-
-static bool kEnabled = YES;
-static bool kiPadCapable = YES;
-//This rotates most apps. May cause issues in some apps on some devices (beta feature)
-
-static bool kWantsDeviceIdiom1;
-// fake device into thinking it's iPad (beta feature)
-
-static bool kWantsLockscreenRotation = YES;
-//Lockscreen rotation  
-
-static bool kWantsIpadStyle = YES; 
-//landscape iPad rotation style
-
-static bool kIphoneStyleRotation = YES;
-//iPhone plus rotation style
-
-static bool kCCisAlwaysRotated = YES;
-//iOS 10 CC always shifted
-
-static bool kWantsDragging = YES;
-//Can rotate while dragging icons
-
-static bool kHideLabels;
-static bool twoRowTweakInstalled;  //currently only checking for Docky
-
-static bool kWantsCustomDock;   //Wants 12 icon dock (iOS 10-12.4.x only) FolderControllerXII and FCXIII both have custom number of icons in dock.
-static bool kRotateMoreApps;
-
-/*This is one of the main methods that rotates apps and makes them more like iPad, but it incorrectly splits or crashes some on compact devices and iPhoneX. Might need to use an AppList for this at some point.  */
-
-%hook SBApplication
--(BOOL)isMedusaCapable {
-if(kEnabled && kiPadCapable) {
-	return YES;
+// Applied preferences live here. The injected sandbox can read "/var/jb/..." on
+// rootless; rootful keeps the bare "/var/mobile/..." path.
+static NSString *AppliedPlistPath(void) {
+    NSString *root = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"] ? @"/var/jb" : @"";
+    return [NSString stringWithFormat:@"%@/var/mobile/Library/Preferences/com.i0stweak3r.autorotate.applied.plist", root];
 }
-return %orig;
+
+// Debug log, written next to the prefs (readable over SSH; no syslog tooling needed).
+// Only active processes that can write the path log — fine for diagnosing system apps
+// like Settings. Toggled by the "Debug logging" switch (applied like any other pref).
+static BOOL gDebug = NO;
+static NSString *JBRoot(void) {
+    return [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"] ? @"/var/jb" : @"";
+}
+static NSString *LogPath(void) {
+    return [NSString stringWithFormat:@"%@/var/mobile/Library/Preferences/com.i0stweak3r.autorotate.debug.log", JBRoot()];
+}
+// Logging is on when either the "Debug" pref is applied OR a marker file exists. The
+// marker decouples diagnosis from the apply pipeline: `touch` it over SSH and every
+// process that loads the dylib logs, no matter what the prefs say.
+static NSString *MarkerPath(void) {
+    return [NSString stringWithFormat:@"%@/var/mobile/autorotate.debug", JBRoot()];
+}
+static BOOL DebugOn(void) {
+    if (gDebug) return YES;
+    // Always log inside Settings — it's the benchmark we're debugging, and this avoids
+    // depending on the Debug pref / marker reaching the process.
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if ([bid isEqualToString:@"com.apple.Preferences"] || [bid isEqualToString:@"com.apple.springboard"]) return YES;
+    return [[NSFileManager defaultManager] fileExistsAtPath:MarkerPath()];
+}
+// Unconditional write — used for the load line so the file appears whenever the dylib
+// loads into a process that can write the path (Settings/SpringBoard can).
+static void ARLogWrite(NSString *line) {
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *path = LogPath();
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh) { @try { [fh seekToEndOfFile]; [fh writeData:data]; } @catch (__unused id e) {} [fh closeFile]; }
+    else    { [data writeToFile:path atomically:YES]; }
+}
+static void ARLog(NSString *fmt, ...) {
+    if (!DebugOn()) return;
+    va_list args; va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
+    ARLogWrite([NSString stringWithFormat:@"%@ [%@] %@\n", [NSDate date], bid, msg]);
+}
+
+// Resolved state for the current process.
+static BOOL gMasterEnabled = NO;   // global master switch
+static BOOL gAppEnabled    = NO;   // this app ticked on
+static UIInterfaceOrientationMask gMask = 0;          // allowed orientations
+static UIInterfaceOrientation gPreferred = UIInterfaceOrientationPortrait; // launch orientation
+
+// Active == we should override this process's orientation behaviour.
+static inline BOOL Active(void) {
+    return gMasterEnabled && gAppEnabled && gMask != 0;
+}
+
+// A single-orientation mask is a hard lock; multi-orientation masks should rotate freely
+// among the allowed set (no forced re-assert).
+static inline BOOL MaskIsSingle(void) {
+    return gMask != 0 && (gMask & (gMask - 1)) == 0;
+}
+
+// Pick a single concrete orientation for presentation / forced launch rotation.
+// Prefer portrait, then landscape-right (the "natural" landscape), then the rest.
+static UIInterfaceOrientation PreferredFromMask(UIInterfaceOrientationMask mask) {
+    if (mask & UIInterfaceOrientationMaskPortrait)           return UIInterfaceOrientationPortrait;
+    if (mask & UIInterfaceOrientationMaskLandscapeRight)     return UIInterfaceOrientationLandscapeRight;
+    if (mask & UIInterfaceOrientationMaskLandscapeLeft)      return UIInterfaceOrientationLandscapeLeft;
+    if (mask & UIInterfaceOrientationMaskPortraitUpsideDown) return UIInterfaceOrientationPortraitUpsideDown;
+    return UIInterfaceOrientationPortrait;
+}
+
+static void LoadPrefs(void) {
+    gMasterEnabled = NO; gAppEnabled = NO; gMask = 0;
+
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (bid.length == 0) return;
+
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:AppliedPlistPath()];
+    gDebug = [prefs[@"Debug"] boolValue];
+    if (!prefs) { ARLog(@"LoadPrefs: no applied plist at %@", AppliedPlistPath()); return; }
+
+    gMasterEnabled = [prefs[@"Enabled"] boolValue];
+    gAppEnabled    = [prefs[[@"enabled-" stringByAppendingString:bid]] boolValue];
+
+    UIInterfaceOrientationMask mask = 0;
+    if ([prefs[[bid stringByAppendingString:@"-Portrait"]] boolValue])      mask |= UIInterfaceOrientationMaskPortrait;
+    if ([prefs[[bid stringByAppendingString:@"-UpsideDown"]] boolValue])    mask |= UIInterfaceOrientationMaskPortraitUpsideDown;
+    if ([prefs[[bid stringByAppendingString:@"-LandscapeLeft"]] boolValue]) mask |= UIInterfaceOrientationMaskLandscapeLeft;
+    if ([prefs[[bid stringByAppendingString:@"-LandscapeRight"]] boolValue])mask |= UIInterfaceOrientationMaskLandscapeRight;
+
+    gMask = mask;
+    gPreferred = PreferredFromMask(mask);
+
+    ARLog(@"LoadPrefs: master=%d appEnabled=%d mask=0x%lx preferred=%ld active=%d",
+          gMasterEnabled, gAppEnabled, (unsigned long)gMask, (long)gPreferred, Active());
+}
+
+// --- Per-class supportedInterfaceOrientations override ----------------------------
+//
+// The app-level _supportedInterfaceOrientationsForWindow: hook isn't enough: UIKit
+// validates rotations against the *view controller's* supportedInterfaceOrientations,
+// and many apps' controllers override that method (so the %hook on UIViewController's
+// base implementation never runs for them — e.g. Settings' root reports portrait only).
+//
+// We can't hook every subclass at load time, so we swizzle on demand: walk the live
+// view-controller tree and replace supportedInterfaceOrientations on each concrete class
+// with one that returns our mask while active (and the original otherwise). Dedup by the
+// Method pointer so inherited implementations are swizzled once.
+static NSMutableSet *gSwizzled;  // NSValues wrapping swizzled Method pointers
+
+static void SwizzleSIO(Class cls) {
+    if (!cls) return;
+    SEL sel = @selector(supportedInterfaceOrientations);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    // The base UIViewController implementation is already handled by the %hook below.
+    if (m == class_getInstanceMethod([UIViewController class], sel)) return;
+    NSValue *key = [NSValue valueWithPointer:m];
+    if ([gSwizzled containsObject:key]) return;
+    [gSwizzled addObject:key];
+
+    __block IMP oldIMP = NULL;
+    IMP newIMP = imp_implementationWithBlock(^UIInterfaceOrientationMask(__unused id me) {
+        if (Active()) return gMask;
+        if (oldIMP) return ((UIInterfaceOrientationMask (*)(id, SEL))oldIMP)(me, sel);
+        return UIInterfaceOrientationMaskAll;
+    });
+    oldIMP = method_setImplementation(m, newIMP);
+}
+
+// Swizzle the class of every controller reachable from a window's root: the root, its
+// presented chain, and all children (nav/tab/split containers).
+static void SwizzleVCTree(UIViewController *vc) {
+    if (![vc isKindOfClass:[UIViewController class]]) return;
+    SwizzleSIO(object_getClass(vc));
+    SwizzleVCTree(vc.presentedViewController);
+    for (UIViewController *child in vc.childViewControllers) SwizzleVCTree(child);
+}
+
+static void SwizzleAllWindows(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) SwizzleVCTree(w.rootViewController);
+    }
+}
+
+// Push the chosen orientation onto the running app. This is the anti-"snaps back to
+// portrait at launch" / anti-"won't start in the chosen mode" measure: returning the
+// mask alone isn't always enough for system apps, so we also actively drive the
+// geometry to the preferred orientation.
+static void ForceOrientation(void) {
+    if (!Active()) return;
+
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return;
+
+    UIInterfaceOrientationMask mask = gMask;
+    UIInterfaceOrientation target = gPreferred;
+
+    // Make the live view controllers agree with our mask before asking UIKit to rotate —
+    // otherwise the geometry request is rejected by a controller that reports portrait.
+    SwizzleAllWindows();
+
+    // SpringBoard rejects programmatic geometry updates ("window display mode doesn't
+    // allow…") and rotates via its own home-screen path instead, so skip the request there.
+    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.springboard"]) return;
+
+    // iOS 16 geometry API. Reached purely through objc_msgSend / NSClassFromString so the
+    // SDK's iOS-16 symbols are never named in source — that avoids both the
+    // -Wunguarded-availability error and the __isPlatformVersionAtLeast builtin that
+    // @available would emit (the Linux toolchain can't link it).
+    SEL reqSel = NSSelectorFromString(@"requestGeometryUpdateWithPreferences:errorHandler:");
+    SEL initSel = NSSelectorFromString(@"initWithInterfaceOrientations:");
+    SEL needsSel = NSSelectorFromString(@"setNeedsUpdateOfSupportedInterfaceOrientations");
+    Class geoClass = NSClassFromString(@"UIWindowSceneGeometryPreferencesIOS");
+    BOOL ios16 = (geoClass && [UIWindowScene instancesRespondToSelector:reqSel]);
+    ARLog(@"ForceOrientation: path=%@ mask=0x%lx target=%ld", ios16 ? @"iOS16" : @"iOS15", (unsigned long)mask, (long)target);
+    if (ios16) {
+        void (^errHandler)(NSError *) = ^(NSError *error) { ARLog(@"requestGeometryUpdate error: %@", error); };
+        for (UIScene *scene in app.connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            ARLog(@"  scene before: interfaceOrientation=%ld", (long)ws.interfaceOrientation);
+            id geo = ((id (*)(id, SEL, NSUInteger))objc_msgSend)([geoClass alloc], initSel, mask);
+            ((void (*)(id, SEL, id, id))objc_msgSend)(ws, reqSel, geo, errHandler);
+            for (UIWindow *w in ws.windows) {
+                UIViewController *root = w.rootViewController;
+                if ([root respondsToSelector:needsSel])
+                    ((void (*)(id, SEL))objc_msgSend)(root, needsSel);
+            }
+        }
+    } else {
+        // iOS 15: nudge the device orientation, then ask UIKit to re-evaluate. The
+        // supportedInterfaceOrientations hook clamps it to the allowed set.
+        UIDeviceOrientation devO = UIDeviceOrientationPortrait;
+        switch (target) {
+            case UIInterfaceOrientationPortrait:           devO = UIDeviceOrientationPortrait; break;
+            case UIInterfaceOrientationPortraitUpsideDown: devO = UIDeviceOrientationPortraitUpsideDown; break;
+            // Device vs interface landscape are mirrored.
+            case UIInterfaceOrientationLandscapeLeft:      devO = UIDeviceOrientationLandscapeRight; break;
+            case UIInterfaceOrientationLandscapeRight:     devO = UIDeviceOrientationLandscapeLeft; break;
+            default: break;
+        }
+        [[UIDevice currentDevice] setValue:@(devO) forKey:@"orientation"];
+        [UIViewController attemptRotationToDeviceOrientation];
+    }
+}
+
+static void ForceOrientationSoon(void) {
+    // Let the scene/window settle first, then force.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ ForceOrientation(); });
+}
+
+#pragma mark - Orientation hooks
+
+// The authoritative gate. UIKit calls this to decide a window's allowed orientations —
+// it already aggregates the whole view-controller hierarchy, the app delegate and
+// Info.plist, so overriding it here clamps everything to our mask regardless of which
+// view controllers override supportedInterfaceOrientations themselves. This is what
+// actually stops the free-spin when the device is rotated.
+%hook UIApplication
+- (UIInterfaceOrientationMask)_supportedInterfaceOrientationsForWindow:(UIWindow *)window {
+    if (Active()) return gMask;
+    return %orig;
+}
+// Public counterpart, present on some versions; harmless to also clamp.
+- (UIInterfaceOrientationMask)supportedInterfaceOrientationsForWindow:(UIWindow *)window {
+    if (Active()) return gMask;
+    return %orig;
 }
 %end
 
-
-//iOS 11.0-12.4.x only method
-
-%hook SBHomeScreenViewController
--(bool)homeScreenAutorotatesEvenWhenIconIsDragging {
-if(kEnabled && kWantsDragging) {
-return TRUE;
+// Secondary clamps for view controllers that don't override these (and so fall through
+// to UIViewController's implementations). The on-demand swizzle handles controllers that
+// *do* override; these cover the rest.
+%hook UIViewController
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    if (Active()) return gMask;
+    return %orig;
 }
-return %orig;
+- (BOOL)shouldAutorotate {
+    if (Active()) return YES;
+    return %orig;
 }
--(void)setHomeScreenAutorotatesEvenWhenIconIsDragging:(bool)arg1 {
-if(kEnabled && kWantsDragging) {
-arg1= TRUE;
-return %orig(arg1);
-}
-return %orig;
-}
-%end
-
-//Lockscreen rotation
-
-%hook SBDashBoardViewController
--(bool) shouldAutorotate {
-if(kEnabled && kWantsLockscreenRotation) {
-return TRUE;
-}
-return %orig;
+- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
+    if (Active()) return gPreferred;
+    return %orig;
 }
 %end
 
+#pragma mark - SpringBoard (home / lock screen / system UI)
 
-%hook SBMedusaSettings
--(bool)anyRotationDebuggingEnabled {
-if(kEnabled) {
-return TRUE;
-}
-return %orig;
-}
-%end
-
-
-/* 
-Normal iOS 11 plus style rotation with verticle dock is automatically picked if enabled is on. iPad style is picked if stacked is on.
-*/
+// SpringBoard doesn't rotate via the standard UIViewController path: its home screen is
+// gated by SpringBoard-specific rotation switches and the physical-orientation lock. We
+// enable rotation and clamp the home-screen controller to our mask; the generic swizzle +
+// geometry request (which also run here) then drive the actual rotation. Only %init'd in
+// the SpringBoard process.
+%group SBRotation
 
 %hook SpringBoard
--(long long) homeScreenRotationStyle {
-if(kEnabled && kWantsIpadStyle) {
-return 1; 
-//iPad rotation style
-}
-else if(kEnabled) {
-return 2;
-}
-else {
-return %orig;
-}
-}
-%end
-
-//works on some apps, about to try hooking the class for all instances
-//this method is experimental- not in any public builds yet
-%hook UIViewController
--(bool)_ignoreAppSupportedOrientations {
-if(kEnabled && kRotateMoreApps) {
-return 1;
-  }
- return %orig;
- }
-%end
-
-
- %hook SBRootIconListView
--(double)topIconInset {
-    if(kEnabled && kWantsIpadStyle) {
-return twoRowTweakInstalled ? 20.f : 0.0009f;
-//if two row tweak(Docky) is installed return 20.f else return 0.0009f
-}
-return %orig;
-}
-
-- (double)bottomIconInset {
-    if(kEnabled && kWantsIpadStyle) {
-        return 0.0009;
+- (long long)homeScreenRotationStyle {
+    if (Active()) {
+        // 1 = iPad grid (breaks layout + vertical dock on iPhone); 2 = iPhone "Plus"
+        // landscape layout (correct icon grid + horizontal dock). Pick per device.
+        return [UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad ? 1 : 2;
     }
     return %orig;
 }
 %end
 
-%hook SBIconListView
--(long long)orientation {
-    if(kEnabled && kWantsIpadStyle) {
-        return 1;
-    }
+%hook SBHomeScreenViewController
+- (BOOL)homeScreenSupportsRotation {
+    if (Active()) return YES;
+    return %orig;
+}
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    if (Active()) { ARLog(@"SBHomeScreenVC supportedInterfaceOrientations -> 0x%lx", (unsigned long)gMask); return gMask; }
     return %orig;
 }
 %end
 
-
-//This method hides the labels by setting scale to zero
-%hook SBIconLabelImageParametersBuilder
-- (double)_scale {
-    if(kEnabled && kHideLabels) {
-        return 0;
-}
-return %orig;
-}
-%end
-
-%hook SBIconView
--(void) setLabelAccessoryViewHidden:(bool)arg1 {  //Hides the cloud for offloaded apps, new-install dots...looks cleaner  
-    if(kEnabled && kHideLabels) {           
-        arg1= YES;
-        return %orig(arg1);
-    }
-    return %orig;
-}
-
--(void) setIconLabelAlpha:(double)arg1 {
-    if(kEnabled && kHideLabels) {
-        arg1= 0;                              //hide labels by making transparent or zero alpha
-        return %orig(arg1);
-    }
-    return %orig;
-}
-%end
-    
-
-%hook SBMainSwitcherViewController
-- (bool)shouldAutorotate {
-if(kEnabled) {
-    return 1;
-} 
-return %orig;
-}
-%end
-
-
-
-
-%hook SBRootFolderController
-- (bool)_shouldSlideDockOutDuringRotationFromOrientation:(long long)arg1 toOrientation:(long long)arg2 {
-     if(kEnabled && kWantsIpadStyle) {
-    arg1 = 2;
-    return YES;
-    %orig;
-}
-return %orig;
-}
-%end
-
-%group iOS13UP
-
-%hook SBRootFolderDockIconListView
-+(NSInteger)rotationAnchor {
-    if(kEnabled) {
-        return 0;
-    }
-    return %orig;
-}
-
-%end
-
-
-%hook SBDockIconListView
-+(NSInteger)rotationAnchor {
-    if(kEnabled) {
-        return 0;
-    }
+// Don't let the user's rotation lock suppress our forced orientation.
+%hook SBOrientationLockManager
+- (BOOL)isUserLocked {
+    if (Active()) return NO;
     return %orig;
 }
 %end
 
-%hook SBRootFolderController
--(BOOL)isDockPinnedForRotation {
-    if(kEnabled && kWantsIpadStyle) {
-        return 0;
-    }
-    else if(kEnabled) {
-        return 1;
-    }
-    else {
-        return %orig;
-    }
-}
-%end
+%end // group SBRotation
 
-%end  //end of group iOS13UP
+#pragma mark - Lifecycle
 
-
-
-// sideways CC for ios 10, this isn't updated for iOS 11+ yet 
-
-
-%hook CCUIControlCenterPageContainerViewController
--(long long) layoutStyle {
-    if(kCCisAlwaysRotated && kEnabled) {
-        return 1;
-    }
-    return %orig;
-}
-%end
-
-// 12 icon dock for iOS 10-12.4.x
-
-%hook SBDockIconListView
-+ (unsigned long long)maxIcons {
-    if(!kEnabled || !kWantsCustomDock) {
-        return %orig;
-    }
- else if(kEnabled && kWantsCustomDock && (firmware <13.0)) {
-    return 13; //Allows up to 12 icons or folder icons in the dock at once.
-} 
- else {
-     return %orig;
- }
-}
-
-- (bool)allowsAddingIconCount:(unsigned long long)count {
-    if(kEnabled && kWantsCustomDock && (firmware < 13.0) && (count < 13)) {
-    return 1;
-%orig;
-} 
-return %orig;
-}
-
-%end
-
-//Just added last update
-
- %hook UIClientRotationContext
-       -(void)setupRotationOrderingKeyboardInAfterRotation:(bool)arg1 {
-           if(kEnabled) { 
-               arg1= YES;
-               return %orig(arg1);
-           }
-              return %orig;
-              }
-              %end
-
-
-//handle prefs with user defaults
-
-static void
-loadPrefs() {
-    static NSUserDefaults *prefs = [[NSUserDefaults alloc]
-                                    initWithSuiteName:@"com.i0stweak3r.autorotate"];
-    kEnabled = [prefs boolForKey:@"enabled"];
-    
-    kWantsCustomDock = ([prefs boolForKey:@"wantsCustomDock"] && (firmware <13.0)) ? [prefs boolForKey:@"wantsCustomDock"] : NO;
-    
-    kHideLabels = [prefs boolForKey:@"hideLabels"];
-
-    kWantsLockscreenRotation = [prefs boolForKey:@"key1"];
-
-    kWantsIpadStyle = [prefs boolForKey:@"key2"];
-    //iPadStyleRotation
-
-    kIphoneStyleRotation = [prefs boolForKey:@"key3"];
-    //defaults to this style if neither stye are selected, not really needed.
-   
-    kCCisAlwaysRotated = [prefs boolForKey:@"key31"];
-    //iOS 10 only so far.
-
-// Beta methods for rotating more apps and having more "medusa" capabilities. 
-kiPadCapable = [prefs boolForKey:@"iPadCapable"];
-kWantsDeviceIdiom1 =[prefs boolForKey:@"wantsDeviceIdiom1"];
-kRotateMoreApps = [prefs boolForKey@"rotateMoreApps"];
-
-// Allows rotation while in icon editing mode on iOS 11-12.4.x. Found a similar method for 13+ just need to add it.
-kWantsDragging = [prefs boolForKey:@"wantsDragging"];
-
-
-
+static void HandleApplied(CFNotificationCenterRef center, void *observer, CFStringRef name,
+                          const void *object, CFDictionaryRef userInfo) {
+    ARLog(@"HandleApplied: reload");
+    LoadPrefs();
+    dispatch_async(dispatch_get_main_queue(), ^{ ForceOrientation(); });
 }
 
 %ctor {
-    CFNotificationCenterAddObserver(
-                                    CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-                                    (CFNotificationCallback)loadPrefs,
-                                    CFSTR("com.i0stweak3r.autorotate/saved"), NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
-    loadPrefs();
-    
-    if([[NSFileManager defaultManager] fileExistsAtPath:@"/Library/MobileSubstrate/DynamicLibraries/me.nepeta.docky.dylib"]) {
-        twoRowTweakInstalled = YES;
-    }
-     else { twoRowTweakInstalled = NO; }
-     
-     %init; //ungrouped
-        
-	if(firmware >= 13) {
-            %init(iOS13UP);
-           
-        }                    
-     
-}  //end of %ctor
-    
-/* 
-Skipping IconSupport, not working for A12 to have more then 4 icons in dock, and I prefer IconState now anyways.
-If I add iOS 13-14 custom dock support I'll use Nepeta's IconState
-    // Register with IconSupport.
-	void *h = dlopen("/Library/MobileSubstrate/DynamicLibraries/IconSupport.dylib", RTLD_NOW);
-	if (h) {
-		[[objc_getClass("ISIconSupport") sharedInstance] addExtension:@"AutoRotate"];
-	}
-*/	
+    @autoreleasepool {
+        gSwizzled = [NSMutableSet set];
+        NSString *procBID = [[NSBundle mainBundle] bundleIdentifier];
+        // Unconditional load line: proves whether the dylib is injected into this process
+        // at all (independent of the Debug pref / apply pipeline).
+        ARLogWrite([NSString stringWithFormat:@"%@ [%@] ctor: dylib loaded\n", [NSDate date], procBID ?: @"?"]);
+        LoadPrefs();
 
+        // Initialise the default (ungrouped) hooks. Required explicitly because the named
+        // group below means Logos no longer auto-inserts this for us.
+        %init;
+        // SpringBoard-specific rotation hooks, only inside SpringBoard.
+        if ([procBID isEqualToString:@"com.apple.springboard"]) %init(SBRotation);
+
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        HandleApplied,
+                                        CFSTR("com.i0stweak3r.autorotate/applied"), NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+
+        // Force the orientation once the app is up and again whenever a scene activates,
+        // covering cold launch and resume-from-background.
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil queue:nil
+                                                      usingBlock:^(NSNotification *n) { ForceOrientationSoon(); }];
+        // Deployment target is iOS 15, so the scene notification is always available.
+        [[NSNotificationCenter defaultCenter] addObserverForName:UISceneDidActivateNotification
+                                                          object:nil queue:nil
+                                                      usingBlock:^(NSNotification *n) { ForceOrientationSoon(); }];
+        // If the user physically rotates the device, re-assert our orientation: catches any
+        // controller that slipped through and pins multi-orientation locks to the preferred.
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIDeviceOrientationDidChangeNotification
+                                                          object:nil queue:nil
+                                                      usingBlock:^(NSNotification *n) {
+            if (Active()) {
+                ARLog(@"DeviceOrientationDidChange: device=%ld", (long)[UIDevice currentDevice].orientation);
+                // Only re-assert a single-orientation hard lock; multi-orientation locks
+                // rotate freely among the allowed set (forcing here would snap upside-down
+                // flips to the preferred orientation).
+                if (MaskIsSingle()) ForceOrientationSoon();
+            }
+        }];
+    }
+}
